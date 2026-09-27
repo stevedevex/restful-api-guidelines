@@ -1133,3 +1133,23 @@ Fill in where the real code lives. Nothing above depends on these values.
 | caller id / preferences / exclusions / output language | |
 | orchestrator · enrichment coordinator · builder base · execution strategy · composition root · scope module | |
 | existing full-payload fixtures | |
+
+
+
+Mnemonics — enough to rebuild this from memory
+The domain letters were chosen so the letter tells you the contract shape, and the shape tells you the real domain:
+
+Letter	Shape (the letter's meaning)	Real domain
+P	Per-entity — one call per child, needs a parent attribute	CRIF
+B	Batch, windowed, generative input — the notes	Contact Notes
+C	Collateral — batch, shared by three sections	Collateral
+M	business Model — batch, generative input	Business Model
+Q	proposals — the only letter with no mnemonic; it is "the other batch child domain"	Credit Proposals
+X	cross-level — read at both parent and child	Financing
+L	parent-Level / Ledger — statements	Financial Statements
+D	Dependent — its request is built from X's output	AML transactions (new)
+Sections were renamed by what they show: Identity = the partner block, Exposures = limits, Financials = statements, Decision = proposals, Assets = collateral, Narrative = the generative pair, Activity = AML.
+
+Entities: Subject is the parent, Relationship the child. attribute α is the one field the per-entity service needs that the published model does not have.
+
+
