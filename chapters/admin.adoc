@@ -1,0 +1,837 @@
+# Admin & Back-Office Operations — Design
+
+---
+
+## 1. The problem
+
+- The UI is hosted behind the **ABC proxy**. Every endpoint it calls must be in a **published,
+  reviewed OpenAPI spec**. Today each new admin capability means another review, and that slows
+  delivery down.
+- **Every admin change needs approval:** one user creates or updates, **another user with the same
+  role** approves or rejects (maker–checker).
+- Data is spread across services. Prompts live in the gen-AI service's database. **Configuration is
+  owned by every service** (the presentation service included), exposed through **the platform**, and
+  stored in the common platform database. **The presentation service has no database of its own.**
+- **The platform** also propagates the user's JWT on every service-to-service call.
+
+## 2. The idea in one picture
+
+```
+WHS-hosted UI ──WHS proxy──▶ PRESENTATION SERVICE (stateless) ─────────────▶ owning services (internal only)
+                              │ 3 generic endpoints, reviewed once            ├─ gen-AI service (KL6)
+                              │   POST /admin/v1/operations                   │    prompts → gen-AI DB
+                              │   POST /admin/v1/queries                      ├─ every service, incl. presentation (local):
+                              │   GET  /admin/v1/catalog                      │    its configuration → platform DB (via the platform)
+                              │                                               └─ (later) other types
+                              ├─ type registry   type → owning service, data schema, role, UI hints
+                              ├─ router          routes by type, never by URL; fans out cross-service lists
+                              └─ validation      JSON Schema of the type, before any routing
+
+        every owning service embeds the SHARED ADMIN KIT (a library):
+        change-request workflow (maker–checker) · versioning · history · audit · validate/apply/query
+        the PLATFORM provides configuration storage and propagates the user's JWT on every hop
+```
+
+**Why the workflow lives with the data:** the change request sits in the **same database** as the
+data it changes: prompt change requests in the gen-AI database, configuration change requests in the
+platform database (through the platform). Approval and apply are then one local step, with no window where a change
+is approved in one service but not yet applied in another. The presentation service stays
+stateless.
+
+## 3. Principles
+
+1. **Types, not endpoints.** Everything is a `type` (`config.gen_ai`, `prompt`, `change_request`, …)
+   with `action`s and `view`s. **Adding a type never changes the OpenAPI spec.** Configuration is one
+   type **per service** (`config.<service>`), because each service has its own keys and schema.
+2. **Type names, never URLs.** The registry maps a type to its owning service. An unknown type is
+   rejected. No client value ever becomes a URL.
+3. **Validated twice:** against the type's JSON Schema in the presentation service, then with domain
+   validation in the owning service.
+4. **One role per type** (e.g. `XYZ`). The **same role** creates, updates, approves and rejects; the
+   only separation is that **the approver is never the maker**.
+5. **Every write is a change request.** Nothing writes directly, and approval is the only path to
+   "apply".
+6. **The live collections hold only approved truth.** Workflow state lives in `change_requests`, so
+   runtime readers can never pick up a draft.
+
+## 4. The contract — request and response shapes
+
+Three endpoints. The bodies are **type-agnostic**: the type-specific part is always `data`, and its
+schema comes from the catalog.
+
+### 4.1 `POST /admin/v1/operations` — every write and every decision
+
+**Request**
+
+```json
+{
+  "type": "config.gen_ai",
+  "action": "update",
+  "key": "AI_GATEWAY_TIMEOUT_MS",
+  "schemaVersion": 1,
+  "baseVersion": 4,
+  "data": { "value": "20000" },
+  "comment": "Financial statements need a longer timeout",
+  "idempotencyKey": "6b0b8f2e-1c55-4a8e-9c1d-2f4b8a7d9e10"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `type` | A type from the catalog: `config.<service>`, `prompt`, … and the built-in `change_request` |
+| `action` | `create` · `update` · `delete` · `rollback` (proposes a change) · `approve` · `reject` · `withdraw` (decides on a change request) |
+| `key` | Which item of the type: a config key, a prompt target, or the change-request id for decisions |
+| `schemaVersion` | Version of the type's `data` schema, so the data can evolve without touching the spec |
+| `baseVersion` | The item version the change is based on (concurrency check); omitted for `create` and for decisions |
+| `data` | Type- and action-specific. `rollback` → `{toVersion}`. Decisions → usually empty. |
+| `comment` | Required for `reject`; recommended otherwise |
+| `idempotencyKey` | UUID; a repeat returns the original result |
+
+**Response.** `202` when a change request was created; `200` for decisions:
+
+```json
+{
+  "type": "config.gen_ai", "action": "update", "key": "AI_GATEWAY_TIMEOUT_MS",
+  "outcome": "SUBMITTED",
+  "changeRequest": {
+    "id": "cr.gen_ai.config.01JBXQ7K2E9F3MBN4P6R7S9T2V",
+    "type": "config.gen_ai", "action": "update", "key": "AI_GATEWAY_TIMEOUT_MS",
+    "status": "SUBMITTED", "baseVersion": 4,
+    "summary": { "key": "admin.cr.summary.config_update", "params": { "key": "AI_GATEWAY_TIMEOUT_MS" },
+                 "text": "Update configuration AI_GATEWAY_TIMEOUT_MS" },
+    "diff": [ { "path": "/value", "change": "modified", "before": "15000", "after": "20000" } ],
+    "payloadHash": "sha256:…", "maker": "t123456",
+    "createdAt": "2026-10-03T10:00:00Z", "expiresAt": "2026-10-10T10:00:00Z",
+    "events": [ { "at": "2026-10-03T10:00:00Z", "actor": "t123456", "action": "SUBMITTED" } ]
+  }
+}
+```
+
+**Approve** (another user with the same role):
+
+```json
+{ "type": "change_request", "action": "approve", "key": "cr.gen_ai.config.01JBXQ7K2E9F3MBN4P6R7S9T2V",
+  "comment": "Agreed with the FS team", "idempotencyKey": "0d1e7c2a-…" }
+
+→ 200 { "type": "change_request", "action": "approve", "key": "cr.gen_ai.config.01JBX…",
+        "outcome": "APPLIED",
+        "changeRequest": { "…": "…", "status": "APPLIED", "appliedVersion": 5, "approver": "t654321",
+                           "effectiveNote": { "key": "admin.cr.effective_within_ttl", "params": { "minutes": 60 },
+                                              "text": "Takes effect within 60 minutes" } } }
+```
+
+`outcome` is one of `SUBMITTED` · `APPLIED` · `REJECTED` · `WITHDRAWN` · `CONFLICT` · `APPLY_FAILED`
+· `EXPIRED`. `CONFLICT` and `APPLY_FAILED` are **outcomes of the change, not errors of the call**.
+
+### 4.2 `POST /admin/v1/queries` — every read
+
+**Request**
+
+```json
+{ "type": "prompt", "view": "get", "key": "CONTACT_NOTES:SUMMARY" }
+{ "type": "prompt", "view": "versions", "key": "CONTACT_NOTES:SUMMARY", "page": { "size": 20 } }
+{ "type": "config.gen_ai", "view": "list", "filter": { "prefix": "AI_" }, "page": { "size": 50 } }
+{ "type": "change_request", "view": "list", "filter": { "status": "SUBMITTED", "awaitingMyApproval": true } }
+```
+
+| Field | Meaning |
+|---|---|
+| `type` | A type from the catalog |
+| `view` | `list` · `get` · `versions` (history of an item) · `diff` (`{fromVersion, toVersion}`) |
+| `key` | For `get`, `versions` and `diff` |
+| `filter` | Type-specific; schema in the catalog |
+| `page` | `{size, cursor}` |
+
+**Response**
+
+```json
+{ "type": "prompt", "view": "get", "key": "CONTACT_NOTES:SUMMARY",
+  "data": { "systemPrompt": "…", "userPrompt": "…", "llmConfig": { "model": "gpt-4.1", "temperature": 0.2 } },
+  "version": 7,
+  "approval": { "changeRequestId": "cr.gen_ai.01J…", "maker": "t123456", "approver": "t654321", "approvedAt": "…" },
+  "openChangeRequest": null }
+
+{ "type": "config.gen_ai", "view": "list", "items": [ { "key": "AI_GATEWAY_TIMEOUT_MS", "data": { "value": "15000" }, "version": 4 } ],
+  "page": { "size": 50, "nextCursor": null } }
+```
+
+`openChangeRequest` tells the UI that an item already has a pending change (only one is allowed), so
+it can show "change pending approval" instead of letting the user edit it.
+
+### 4.3 `GET /admin/v1/catalog` — what exists, and how to render it
+
+```json
+{ "types": [
+  { "type": "config.gen_ai",
+    "title": { "key": "admin.type.config.gen_ai", "text": "Configuration — gen-AI service" },
+    "keyField": "key",
+    "actions": ["create", "update", "delete", "rollback"],
+    "views": ["list", "get", "versions", "diff"],
+    "schemaVersion": 1,
+    "dataSchema": { "type": "object", "required": ["value"], "properties": { "value": { "type": "string", "maxLength": 4000 } } },
+    "filterSchema": { "type": "object", "properties": { "prefix": { "type": "string" } } },
+    "ui": { "group": "configuration", "listColumns": ["key", "data.value", "version", "approval.approvedAt"], "widgets": { "value": "text" } },
+    "requiresApproval": true,
+    "callerMay": ["read", "write", "decide"] },
+  { "type": "prompt", "…": "…", "ui": { "widgets": { "systemPrompt": "textarea", "userPrompt": "textarea" } } }
+] }
+```
+
+The admin UI **renders lists and forms from `dataSchema` + `ui`**. The response is filtered to the
+types the caller's role allows, and it carries an **ETag**.
+
+## 5. The type registry (presentation service)
+
+```yaml
+# admin_registry/types.yaml  — changed by reviewed PR; validated at startup
+types:
+  config.gen_ai:                     # one config type per service — each service owns its configuration
+    owner: gen_ai
+    role: XYZ
+    schema_version: 1
+    data_schema: owner               # fetched from the owner's /internal/admin/schemas
+    ui: { group: configuration, list_columns: [key, data.value, version, approval.approvedAt] }
+    change_request: { expires_after_days: 7 }
+  config.business:      { owner: business,        role: XYZ, schema_version: 1, data_schema: owner, ui: { group: configuration } }
+  config.data_collection: { owner: data_collection, role: XYZ, schema_version: 1, data_schema: owner, ui: { group: configuration } }
+  config.presentation:  { owner: local,           role: XYZ, schema_version: 1, data_schema: local, ui: { group: configuration } }
+  prompt:
+    owner: gen_ai
+    role: XYZ
+    schema_version: 1
+    data_schema: owner
+    ui: { widgets: { systemPrompt: textarea, userPrompt: textarea } }
+    change_request: { expires_after_days: 7 }
+```
+
+```yaml
+# presentation-service settings (per environment)
+admin_owners:                        # the user's JWT is propagated by the platform on every call
+  gen_ai:          { base_url: https://…/internal/admin }
+  business:        { base_url: https://…/internal/admin }
+  data_collection: { base_url: https://…/internal/admin }
+  # owner "local" = the presentation service's own configuration, handled in-process
+```
+
+**Adding a type** is a new registry entry, plus either a handler in the owning service or nothing at
+all for a *generic* type (§7.2), plus the UI rendering it from the catalog. **The OpenAPI spec never
+changes.**
+
+**Startup checks.** *Hard* (the service doesn't start): the registry is well-formed, every owner is
+configured, every type has a role and requires approval, names are unique. *Soft* (logged, retried):
+the owners' schemas can be fetched; until they load, that owner's types show as `unavailable` in the
+catalog and return `502`.
+
+## 6. Maker–checker workflow
+
+### 6.1 Lifecycle
+
+```
+              submit (maker, role XYZ)       approve (another user, role XYZ)       apply ok
+  create/update/delete/rollback ──▶ SUBMITTED ──────────────────────────────▶ APPROVED ──────▶ APPLIED
+                                       │  │                                       │
+                                reject │  │ withdraw (maker only)    apply fails  │  item changed since submit
+                                       ▼  ▼                                       ▼               ▼
+                                  REJECTED  WITHDRAWN                       APPLY_FAILED      CONFLICT
+                         after expires_after_days ──▶ EXPIRED
+```
+
+### 6.2 Rules — enforced by the shared kit, never trusted from the client
+
+1. **One approval, from a different user holding the same role.** Maker and approver are taken from
+   the authenticated identity, never from the payload.
+2. **One open change request per item** (type + key), enforced by a unique partial index.
+3. **Optimistic concurrency:** `baseVersion` at submit, `expectedVersion` at apply; a mismatch gives
+   `CONFLICT`, and the maker resubmits against the new version.
+4. **Immutable payload:** the approver approves exactly what was submitted (`payloadHash`). To change
+   it, withdraw and resubmit.
+5. **Atomic state changes** (compare-and-set on `status`): two approvers or an approve/withdraw race
+   can't both win.
+6. **Idempotency:** `(actor, idempotencyKey)` is unique.
+7. **Expiry:** default 7 days per type; enforced when a decision is attempted, and closed by a sweep.
+8. **Immutable audit:** every transition appends `{at, actor, action, comment}`, and before/after
+   snapshots are kept with the change request.
+9. **Visibility:** everyone with the type's role sees that type's change requests (the same role
+   proposes and approves).
+10. **Re-validated at apply** by the owning service.
+11. **No CID in admin payloads.**
+12. The **decision actions** (`approve`, `reject`, `withdraw`) are the only writes without approval,
+    because they *are* the approval. **Break-glass changes are out of scope.**
+13. **Rollback** is a change request too (`action: rollback, data: {toVersion}`).
+14. **One change request = one item.** Batch changes are a later extension.
+
+### 6.3 Applying inside the owning service
+
+Approval and apply happen **in the same service, against the same database**:
+
+1. Compare-and-set the change request `SUBMITTED → APPROVED`.
+2. Write the history entry, which is idempotent: unique index on its change-request id.
+3. Update the live item with a version check.
+4. Mark the change request `APPLIED` with `appliedVersion`.
+
+Every step can be repeated safely, so a crash after step 1, 2 or 3 is finished on the next attempt
+(a retry by the approver, or a periodic sweep of requests stuck in `APPROVED`). **MongoDB
+transactions are not required** (they are out of scope, AD8).
+
+### 6.4 When an approved change takes effect
+
+Readers cache with a **1-hour TTL** (agreed, AD4), so an applied change **takes effect within 60
+minutes**. The response says so (`effectiveNote`), and the admin UI shows it. A summary generated
+during that window may still use the previous version; its `generation.promptVersion` records which
+one, so it stays traceable.
+
+## 7. What the owning services implement
+
+### 7.1 The internal interface (from the shared kit; never exposed through WHS)
+
+| Internal endpoint | Purpose |
+|---|---|
+| `GET  /internal/admin/schemas` | `dataSchema`, `filterSchema` and UI hints for the types it owns |
+| `POST /internal/admin/operations` | The same envelope as §4.1. The kit runs the workflow; the type handler does validate and apply. |
+| `POST /internal/admin/queries` | The same envelope as §4.2 |
+
+**Identity:** the platform **propagates the user's JWT** on the call. The owning service validates it
+(through the platform) and **itself** checks role `XYZ` and approver ≠ maker. It never relies on the
+presentation service's checks alone. The internal endpoints are not published through WHS, so the
+UI can't reach them directly.
+
+### 7.2 Type handlers — or none at all
+
+| Kind of type | What the owning service writes | Example |
+|---|---|---|
+| **Service-backed** | A small handler: `validate(data)`, `apply(data, expectedVersion)` against its own collection, and its read views | `prompt` (domain checks: the target exists, `llm_config` limits), `config` |
+| **Generic** | **Nothing.** The kit stores items in a generic `admin_items` collection (`type`, `key`, `version`, `data`); validation is the JSON Schema alone | simple lookup tables or toggles added later |
+
+## 8. Collection changes — answer to "do we need to update the schemas?"
+
+**Yes, minimally.** The workflow does **not** go into the live collections.
+
+| Collection (database) | Change |
+|---|---|
+| `prompts` (gen-AI) **[VERIFY]** | Add `version: int` and `approval: {change_request_id, maker, approver, approved_at}`. Unique `(target_identifier, target_type)` stays. |
+| **`prompt_versions`** (gen-AI, **new**) | Append-only snapshot per applied version; unique `(target_identifier, target_type, version)` and unique `approval.change_request_id`. Needed for rollback, and for traceability of `generation.promptVersion`. |
+| `configurations` (platform DB, **per service**) **[VERIFY]**, agreed AD3 | Add `version: int` and the same `approval` block |
+| `configuration_versions` (platform DB, new) | Append-only history, the same as for prompts |
+| **`change_requests`** (**next to the data**: gen-AI DB for prompts, platform DB for configuration) | `{id, type, action, key, schemaVersion, baseVersion, data, payloadHash, before, after, diff, status, maker, approver, events[], idempotencyKey, createdAt, expiresAt, appliedVersion}`. Indexes: one open request per `(type, key)`; unique `(actor, idempotencyKey)`; `(status, createdAt)`. |
+| `admin_items` (only where generic types are used) | `{type, key, version, data, approval}`, with its own history |
+
+**Migration:** set `version = 1` on existing prompts and configurations, and snapshot them as version
+1 in their history collections.
+
+**Change-request ids carry their type's owner** (`cr.gen_ai.prompt.…`, `cr.business.config.…`,
+`cr.presentation.config.…`), so the presentation service routes decisions without storing anything. A cross-type "awaiting approval" list is built by
+**fanning out** to the owners and merging by `createdAt`.
+
+## 9. Flows
+
+```
+Maker  ─POST operations {type: prompt, action: update, key, baseVersion, data}─▶ Presentation
+          Presentation: authenticate · registry(type) · role XYZ · JSON-Schema(data)
+          Presentation ─▶ gen-AI /internal/admin/operations
+              kit: one-open-per-item · domain validate · diff · change request SUBMITTED · audit ─▶ 202
+Checker ─POST queries {type: change_request, view: list, filter: {awaitingMyApproval}}─▶ fan-out ─▶ merged list
+Checker ─POST operations {type: change_request, action: approve, key: cr.gen_ai.prompt.…}─▶ Presentation ─▶ gen-AI
+              kit: approver ≠ maker · role XYZ · not expired · SUBMITTED→APPROVED · history · live(version check)
+                   · APPLIED(appliedVersion) · audit ─▶ 200 {outcome: APPLIED, effectiveNote: "within 60 minutes"}
+```
+
+## 10. The UI side
+
+- **Generic screens**: a type list from the catalog; for each type a list (`ui.listColumns`), a
+  detail view, history (`versions`), and an edit form generated from `dataSchema` + `ui.widgets`.
+- **"Waiting for approval"** shows all `SUBMITTED` change requests the user didn't create, with the diff
+  and approve / reject buttons.
+- **"Pending change"** on an item that has an `openChangeRequest`.
+- **Errors** are `application/problem+json` (RFC 9457) with a stable `code`, a `LocalizedText` message,
+  field `errors[]` with JSON paths (never input values), `retryable` and `correlationId`. This is the
+  same shape as the memo API ([`api_response_model.md`](api_response_model.md) §12).
+
+## 11. Observability and security
+
+| Concern | How |
+|---|---|
+| Who changed what, when, approved by whom | the change request's immutable events, plus `approval` on the live item and in its history |
+| Change requests waiting too long | metric `admin.change_request.pending_age{type}` |
+| Misuse | refused calls logged with type, action, actor and reason (no payload); rate limit per actor |
+| Payload abuse | 256 KB limit (`413`); JSON Schema before routing; no URLs from the client |
+| End-to-end tracing | optional `X-Correlation-Id`, forwarded and stored on the change request |
+| Service-to-service | the user's JWT is propagated by the platform; `/internal/admin` is not published through WHS, and every owning service re-checks role and maker ≠ checker |
+
+admin_operations_openapi.yaml
+openapi: 3.0.3
+info:
+  title: Credit Memo — Admin & Back-Office Operations (generic, type-agnostic)
+  version: 1.0.0
+  description: |
+    One generic contract for every admin and back-office capability reachable from the WHS-hosted UI.
+    **This contract does not change when new admin types are added**: a type is a value of `type`,
+    and its data schema is published at runtime in the catalog.
+
+    * **Writes** (`create`, `update`, `delete`, `rollback`) create a **change request**. Another user
+      with the same role must approve it (maker–checker) before it takes effect.
+    * **Decisions** (`approve`, `reject`, `withdraw`) act on a change request (`type: change_request`).
+    * **Reads** are queries with a `view` (`list`, `get`, `versions`, `diff`).
+    * The **catalog** lists the types the caller may use, with JSON Schemas and UI hints.
+
+    Types are resolved by a server-side registry; clients never supply target URLs.
+    Design: docs_new/admin_operations_api.md
+servers:
+  - url: https://{whs-host}/credit-memo
+    variables:
+      whs-host:
+        default: whs.example.internal
+security:
+  - bearerAuth: []
+tags:
+  - name: admin
+paths:
+  /admin/v1/operations:
+    post:
+      tags: [admin]
+      operationId: executeOperation
+      summary: Propose a change (create / update / delete / rollback) or decide on one (approve / reject / withdraw)
+      description: |
+        Proposals return **202** with a change request in `SUBMITTED` state. Decisions return **200** with the
+        resulting `outcome`; `CONFLICT` and `APPLY_FAILED` are outcomes of the change, not errors of the call.
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OperationRequest' }
+            examples:
+              updateConfig:
+                value:
+                  type: config.gen_ai
+                  action: update
+                  key: AI_GATEWAY_TIMEOUT_MS
+                  schemaVersion: 1
+                  baseVersion: 4
+                  data: { value: "20000" }
+                  comment: Financial statements need a longer timeout
+                  idempotencyKey: 6b0b8f2e-1c55-4a8e-9c1d-2f4b8a7d9e10
+              updatePrompt:
+                value:
+                  type: prompt
+                  action: update
+                  key: "CONTACT_NOTES:SUMMARY"
+                  schemaVersion: 1
+                  baseVersion: 7
+                  data:
+                    systemPrompt: "…"
+                    userPrompt: "…"
+                    llmConfig: { model: gpt-4.1, temperature: 0.2, maxTokens: 1200 }
+                  comment: Tighten the summary instructions
+                  idempotencyKey: 1f2e3d4c-5b6a-4987-8a1b-2c3d4e5f6a7b
+              approve:
+                value:
+                  type: change_request
+                  action: approve
+                  key: cr.gen_ai.config.01JBXQ7K2E9F3MBN4P6R7S9T2V
+                  comment: Agreed with the FS team
+                  idempotencyKey: 0d1e7c2a-9b3f-4d6e-8a1b-5c7d9e2f4a6b
+      responses:
+        '200':
+          description: Decision processed (approve / reject / withdraw)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResponse' }
+        '202':
+          description: Change request created, waiting for approval
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/OwnerUnavailable' }
+  /admin/v1/queries:
+    post:
+      tags: [admin]
+      operationId: executeQuery
+      summary: Read items of a type (list / get / versions / diff), including change requests
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueryRequest' }
+            examples:
+              getPrompt:
+                value: { type: prompt, view: get, key: "CONTACT_NOTES:SUMMARY" }
+              listConfig:
+                value: { type: config.gen_ai, view: list, filter: { prefix: AI_ }, page: { size: 50 } }
+              awaitingMyApproval:
+                value: { type: change_request, view: list, filter: { status: SUBMITTED, awaitingMyApproval: true } }
+      responses:
+        '200':
+          description: Query result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/OwnerUnavailable' }
+  /admin/v1/catalog:
+    get:
+      tags: [admin]
+      operationId: getCatalog
+      summary: The admin types available to the caller, with JSON Schemas and UI hints
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Catalog filtered to the caller's roles
+          headers:
+            ETag:
+              description: Changes when the registry or an owner's schema changes; use If-None-Match.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Catalog' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '500': { $ref: '#/components/responses/InternalError' }
+components:
+  parameters:
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Optional id to trace a request end to end; stored on change requests.
+      schema: { type: string, maxLength: 128 }
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    TypeName:
+      type: string
+      description: An admin type from the catalog (e.g. prompt, config.gen_ai, config.presentation) or the built-in change_request.
+      pattern: '^[a-z][a-z0-9_]{0,63}(\.[a-z][a-z0-9_]{0,63})?$'
+      example: config.gen_ai
+    Action:
+      type: string
+      description: Proposals create a change request; decisions act on one (type change_request).
+      enum: [create, update, delete, rollback, approve, reject, withdraw]
+    View:
+      type: string
+      enum: [list, get, versions, diff]
+    Outcome:
+      type: string
+      enum: [SUBMITTED, APPLIED, REJECTED, WITHDRAWN, CONFLICT, APPLY_FAILED, EXPIRED]
+    LocalizedText:
+      type: object
+      description: Translatable text — the UI translates `key` (with `params`) or shows the English `text`.
+      required: [key, text]
+      properties:
+        key: { type: string, example: admin.error.approver_is_maker }
+        params:
+          type: object
+          additionalProperties: true
+        text: { type: string, example: The approver must be a different user from the requester. }
+    OperationRequest:
+      type: object
+      required: [type, action, key, idempotencyKey]
+      additionalProperties: false
+      properties:
+        type: { $ref: '#/components/schemas/TypeName' }
+        action: { $ref: '#/components/schemas/Action' }
+        key:
+          type: string
+          maxLength: 256
+          description: Item key within the type, or the change-request id for decisions.
+        schemaVersion:
+          type: integer
+          minimum: 1
+          description: Version of the type's data schema (required for proposals).
+        baseVersion:
+          type: integer
+          minimum: 1
+          description: Item version the change is based on (required for update, delete, rollback).
+        data:
+          type: object
+          description: Type- and action-specific; validated against the catalog's dataSchema. rollback → {toVersion}.
+          additionalProperties: true
+        comment:
+          type: string
+          maxLength: 2000
+          description: Required for reject.
+        idempotencyKey: { type: string, format: uuid }
+    OperationResponse:
+      type: object
+      required: [type, action, key, outcome]
+      properties:
+        type: { $ref: '#/components/schemas/TypeName' }
+        action: { $ref: '#/components/schemas/Action' }
+        key: { type: string }
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        changeRequest: { $ref: '#/components/schemas/ChangeRequest' }
+    QueryRequest:
+      type: object
+      required: [type, view]
+      additionalProperties: false
+      properties:
+        type: { $ref: '#/components/schemas/TypeName' }
+        view: { $ref: '#/components/schemas/View' }
+        key:
+          type: string
+          maxLength: 256
+          description: Required for get, versions and diff.
+        filter:
+          type: object
+          description: Type-specific; validated against the catalog's filterSchema. For diff, {fromVersion, toVersion}.
+          additionalProperties: true
+        page: { $ref: '#/components/schemas/PageRequest' }
+    QueryResponse:
+      type: object
+      required: [type, view]
+      properties:
+        type: { $ref: '#/components/schemas/TypeName' }
+        view: { $ref: '#/components/schemas/View' }
+        key: { type: string }
+        data:
+          type: object
+          description: For get and diff — the item's data (dataSchema) or the diff.
+          additionalProperties: true
+        version: { type: integer }
+        approval: { $ref: '#/components/schemas/ApprovalInfo' }
+        openChangeRequest:
+          allOf:
+            - $ref: '#/components/schemas/ChangeRequest'
+          nullable: true
+          description: The pending change request for this item, if any (at most one).
+        items:
+          type: array
+          description: For list and versions.
+          items: { $ref: '#/components/schemas/Item' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+    Item:
+      type: object
+      required: [key]
+      properties:
+        key: { type: string }
+        data:
+          type: object
+          additionalProperties: true
+        version: { type: integer }
+        approval: { $ref: '#/components/schemas/ApprovalInfo' }
+        hasOpenChangeRequest: { type: boolean }
+    ApprovalInfo:
+      type: object
+      properties:
+        changeRequestId: { type: string }
+        maker: { type: string }
+        approver: { type: string }
+        approvedAt: { type: string, format: date-time }
+    PageRequest:
+      type: object
+      properties:
+        size: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        cursor: { type: string }
+    PageInfo:
+      type: object
+      properties:
+        size: { type: integer }
+        nextCursor: { type: string, nullable: true }
+    Catalog:
+      type: object
+      required: [types]
+      properties:
+        types:
+          type: array
+          items: { $ref: '#/components/schemas/CatalogType' }
+    CatalogType:
+      type: object
+      required: [type, title, keyField, actions, views, schemaVersion, dataSchema, requiresApproval, callerMay, available]
+      properties:
+        type: { $ref: '#/components/schemas/TypeName' }
+        title: { $ref: '#/components/schemas/LocalizedText' }
+        description: { $ref: '#/components/schemas/LocalizedText' }
+        keyField: { type: string, example: key }
+        actions:
+          type: array
+          items: { $ref: '#/components/schemas/Action' }
+        views:
+          type: array
+          items: { $ref: '#/components/schemas/View' }
+        schemaVersion: { type: integer }
+        dataSchema:
+          type: object
+          description: JSON Schema (draft 2020-12) of `data` for this type.
+          additionalProperties: true
+        filterSchema:
+          type: object
+          description: JSON Schema of `filter` for list queries.
+          additionalProperties: true
+        ui:
+          type: object
+          description: Rendering hints (group, list columns, widgets, field order); opaque to the API.
+          additionalProperties: true
+        requiresApproval: { type: boolean }
+        callerMay:
+          type: array
+          items: { type: string, enum: [read, write, decide] }
+        available:
+          type: boolean
+          description: False while the owning service's schemas cannot be loaded.
+    ChangeRequest:
+      type: object
+      required: [id, type, action, key, status, maker, createdAt]
+      properties:
+        id:
+          type: string
+          description: Carries the owner and type (e.g. cr.gen_ai.prompt.…, cr.business.config.…).
+          example: cr.gen_ai.config.01JBXQ7K2E9F3MBN4P6R7S9T2V
+        type: { $ref: '#/components/schemas/TypeName' }
+        action: { $ref: '#/components/schemas/Action' }
+        key: { type: string }
+        status: { $ref: '#/components/schemas/Outcome' }
+        summary: { $ref: '#/components/schemas/LocalizedText' }
+        baseVersion: { type: integer, nullable: true }
+        appliedVersion: { type: integer, nullable: true }
+        payloadHash:
+          type: string
+          description: Hash of the submitted data; the approval and the apply refer to exactly this payload.
+        diff:
+          type: array
+          items: { $ref: '#/components/schemas/DiffEntry' }
+        maker: { type: string }
+        approver: { type: string, nullable: true }
+        effectiveNote:
+          $ref: '#/components/schemas/LocalizedText'
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEvent' }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+    DiffEntry:
+      type: object
+      required: [path, change]
+      properties:
+        path: { type: string, example: /value }
+        change: { type: string, enum: [added, removed, modified] }
+        before: {}
+        after: {}
+    AuditEvent:
+      type: object
+      required: [at, actor, action]
+      properties:
+        at: { type: string, format: date-time }
+        actor: { type: string }
+        action:
+          type: string
+          enum: [SUBMITTED, APPROVED, REJECTED, WITHDRAWN, APPLIED, APPLY_FAILED, CONFLICT, EXPIRED]
+        comment: { type: string }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable, machine-readable code. Current set:
+            UNKNOWN_TYPE, UNSUPPORTED_ACTION, UNSUPPORTED_SCHEMA_VERSION, VALIDATION_FAILED, ROLE_MISSING,
+            APPROVER_IS_MAKER, CHANGE_REQUEST_OPEN_FOR_ITEM, VERSION_CONFLICT, CHANGE_REQUEST_EXPIRED,
+            INVALID_STATE, NOT_FOUND, PAYLOAD_TOO_LARGE, RATE_LIMITED, OWNER_UNAVAILABLE, UNAUTHENTICATED,
+            INTERNAL_ERROR.
+          example: APPROVER_IS_MAKER
+        message: { $ref: '#/components/schemas/LocalizedText' }
+        path:
+          type: string
+          description: JSON pointer into the request, for validation errors.
+          example: /data/llmConfig/temperature
+    ProblemDetails:
+      type: object
+      description: RFC 9457 Problem Details with extensions. Input values are never echoed back; only JSON paths.
+      required: [type, title, status, code, message, retryable, correlationId]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Stable URI per code.
+          example: https://credit-memo.internal/errors/APPROVER_IS_MAKER
+        title:
+          type: string
+          description: English, for logs; the UI shows `message`.
+          example: Approver is the maker
+        status: { type: integer, example: 403 }
+        instance: { type: string, example: /admin/v1/operations }
+        code:
+          type: string
+          description: Same set as Error.code.
+          example: APPROVER_IS_MAKER
+        message: { $ref: '#/components/schemas/LocalizedText' }
+        errors:
+          type: array
+          description: Field-level problems.
+          items: { $ref: '#/components/schemas/Error' }
+        retryable: { type: boolean }
+        correlationId: { type: string }
+  responses:
+    ValidationFailed:
+      description: Request failed schema or domain validation
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Unauthenticated:
+      description: Missing or invalid token
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Forbidden:
+      description: Caller lacks the type's role, or tries to approve their own change request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    NotFound:
+      description: Unknown type, item or change request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Conflict:
+      description: A change request is already open for the item, or the item changed since baseVersion
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    PayloadTooLarge:
+      description: Request body above the size limit (256 KB)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    InternalError:
+      description: Unexpected error; details only in logs, under the correlation id
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    OwnerUnavailable:
+      description: The service owning the type could not be reached
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
