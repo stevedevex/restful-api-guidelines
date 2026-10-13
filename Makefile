@@ -89,5 +89,48 @@ pdf: $(DIRINCLUDES) check pull
 epub: $(DIRINCLUDES) check pull
 	$(DOCKER) run --interactive --user=$$(id -u):$$(id -g) \
 	  --volume=$(DIRWORK):$(DIRMOUNTS)/ \
+
+
+Hi [Name],
+
+Thanks for filling in §5b. I’ll merge the LTV standards and amortization thresholds into the spec.
+
+You asked what’s next. Before we tackle the open questions at the end, I’d like to confirm a few data and config points, because they decide whether we can feed the model from our current stack. That stack is our data model, the data collection service, and the Python GenAI service. The optimizer would run inside the GenAI service as a deterministic step before the summary is generated. Once these are answered, the open questions that block the build (OQ-28, 30, 32, 33, 34) get much easier to close. The rest can follow.
+
+Some of these probably need the data collection team or Lucrezia. I’ve noted who I think can answer each one, so feel free to forward.
+
+Most important: these could change the design
+
+Other lenders’ notes. Do we receive every registered mortgage note on a property in rank order, including notes held by other lenders? Or only our own notes? Prior liens and legal capacity (§5.6) depend on the other lenders’ notes. (Data collection team, Collateral system)
+Allocation engine output. Do we already get the engine’s allocated and available collateral? If so, is it per limit × property or per limit × note? Is it CHF of note nominal? Can the same spare headroom show as available under several limits (OQ-30)? The contractual scenario depends on this. (Lucrezia, data collection team)
+Group Credit Memos. When limits and properties belong to different legal entities, may a property of entity A secure a limit of entity B in the unconstrained scenario? Or only within the same entity? This changes the model itself. (You, Credit / Legal)
+§5b keys. For each attribute your tables use (type, age and anything else you added): do we have it as a field in our real-estate data model, and do our codes map 1:1 to your categories? How are mixed-use properties classified? (Data collection team)
+Hosting and governance. Can the optimizer run as a deterministic module inside our GenAI service, with the LLM only describing the result and never calculating it? Or does model-risk policy require a separate, independently validated component? (You, Model risk)
+
+Data points
+
+How do we identify a limit as real-estate secured (OQ-32)? Which field gives its exposure: the limit amount, the drawn amount, or drawn plus undrawn? (Data collection team, you)
+Do we have the lending value (Belehnungswert) and its valuation date, or only the market value? (Data collection team)
+Are construction year and renovation year available and reliable? If one is missing, should we reject the property or use a fallback row, for example the most conservative one? (You, data collection team)
+How common are joint liens, meaning one note over several properties? The spec rejects them today, so if they’re common, many Credit Memos would fail. (Lucrezia)
+Is non-real-estate collateral (securities, cash, guarantees) on the same limits in our data model? Should we ignore it, or deduct it from the exposure first (OQ-33)? (You)
+Do non-CHF limits or properties abroad occur? Should we exclude them or reject the Credit Memo? (You)
+What are the typical and maximum numbers of properties and limits per Credit Memo? Do we also need batch re-runs across the portfolio, or only runs when a Credit Memo is created? (You)
+
+Config
+
+Policy tables. Who owns the §5b tables, and how often do they change? Should they live in our code repository (one release per change) or somewhere credit policy can edit them directly? When policy changes, do we re-run an old Credit Memo with the table that was valid on its as-of date? (You, Credit policy)
+Amortization. Is the policy always “rate × amount above the threshold”, for example amortize down to the threshold within N years? Or are there fixed minimums, or rates that vary by LTV? If it’s always linear, we can drop two of the three rule types. (You, Credit policy)
+RWA. Since a relative figure is enough, I propose one flat indicative weight per row of your table, labelled “indicative” wherever users see it. Together with linear amortization, this removes the LTV-band logic, the most intricate part of the preprocessing. Is that OK, or would you rather drop the RWA stage entirely? (You)
+
+Output and operations
+
+Where should the result appear: a two-column table in the Credit Memo, the UI, the GenAI summary? Who uses the per-limit line items? (You)
+If one property lacks data, should the whole calculation stop, as the spec says today? Or should we calculate with what we have and flag the gap? (You)
+The spec requires every run to be stored for 10 years and to be re-runnable (§12). Does the Credit Memo platform already keep the payload and the result, or is that new storage? (You, Architecture / Compliance)
+
+If it’s easier, we can go through 1–5 in a 30-minute call and do the rest by email.
+
+Thanks,
 	  $(ASCIIDOC) asciidoctor-epub3 -D $(DIRMOUNTS)/$(DIRBUILDS) index.adoc;
 	mv -f $(DIRBUILDS)/index.epub $(DIRBUILDS)/zalando-guidelines.epub;
